@@ -3,8 +3,8 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-let openAiBillingUnavailable = false;
 let geminiApiKeyInvalid = false;
+let groqApiKeyInvalid = false;
 
 app.use(cors());
 app.use(express.json());
@@ -186,7 +186,7 @@ function buildFallbackHtml(prompt, theme = "light", sections = {}, brandStyle = 
 }
 
 async function generateWithGemini(prompt, theme, sections, brandStyle = "minimal", audience = "general audience", ctaLabel = "Get Started") {
-  const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY;
   if (!geminiKey || geminiApiKeyInvalid) return null;
 
   try {
@@ -246,20 +246,22 @@ async function generateWithGemini(prompt, theme, sections, brandStyle = "minimal
   }
 }
 
-async function generateWithOpenAI(prompt, theme, sections, brandStyle = "minimal", audience = "general audience", ctaLabel = "Get Started") {
-  const openAiKey = process.env.OPENAI_API_KEY;
-  if (!openAiKey || openAiBillingUnavailable || process.env.ENABLE_PAID_AI !== "true") return null;
+async function generateWithGroq(prompt, theme, sections, brandStyle = "minimal", audience = "general audience", ctaLabel = "Get Started") {
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey || groqApiKeyInvalid) return null;
 
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
+      signal: AbortSignal.timeout(10000),
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${openAiKey}`,
+        Authorization: `Bearer ${groqKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0.7,
+        model: process.env.GROQ_MODEL || "openai/gpt-oss-20b",
+        temperature: 0.45,
+        max_completion_tokens: 3000,
         messages: [
           {
             role: "system",
@@ -277,24 +279,43 @@ async function generateWithOpenAI(prompt, theme, sections, brandStyle = "minimal
     const data = await response.json();
 
     if (!response.ok) {
-      throw new Error(data?.error?.message || "OpenAI request failed");
+      if (response.status === 401 || response.status === 403) {
+        groqApiKeyInvalid = true;
+      }
+      throw new Error(data?.error?.message || "Groq request failed");
     }
 
     const html = data?.choices?.[0]?.message?.content;
     const sanitizedHtml = sanitizeGeneratedHtml(html);
 
     if (!sanitizedHtml) {
-      throw new Error("OpenAI returned empty HTML");
+      throw new Error("Groq returned empty HTML");
+    }
+
+    if (!/<html[\s>]/i.test(sanitizedHtml) || !/<body[\s>]/i.test(sanitizedHtml) || !/<\/html>/i.test(sanitizedHtml)) {
+      throw new Error("Groq returned incomplete HTML");
     }
 
     return sanitizedHtml;
   } catch (error) {
-    if (/no credits|insufficient_quota|billing|quota/i.test(error.message)) {
-      openAiBillingUnavailable = true;
-    }
-    console.warn("OpenAI failed, falling back:", error.message);
+    console.warn("Groq failed, falling back:", error.message);
     return null;
   }
+}
+
+function getFallbackNote(hasConfiguredAiKey) {
+  if (geminiApiKeyInvalid && groqApiKeyInvalid) {
+    return "Gemini and Groq API keys are invalid; using the local fallback generator.";
+  }
+  if (geminiApiKeyInvalid) {
+    return "Gemini is unavailable and Groq did not return a valid page; using the local fallback generator.";
+  }
+  if (groqApiKeyInvalid) {
+    return "Groq API key is invalid and Gemini is unavailable; using the local fallback generator.";
+  }
+  return hasConfiguredAiKey
+    ? "Gemini and Groq are unavailable, so the local fallback generator is being used."
+    : "No Gemini or Groq API key is configured; using the local fallback generator.";
 }
 app.get("/", (req, res) => {
   res.json({
@@ -324,9 +345,7 @@ app.post("/api/generate", async (req, res) => {
   const selectedAudience = String(audience || "general audience").trim() || "general audience";
   const selectedCta = String(ctaLabel || "Get Started").trim() || "Get Started";
 
-  const hasFreeAiKey =
-    Boolean(process.env.GEMINI_API_KEY) ||
-    Boolean(process.env.GOOGLE_API_KEY);
+  const hasConfiguredAiKey = Boolean(process.env.GEMINI_API_KEY) || Boolean(process.env.GROQ_API_KEY);
 
   try {
     const htmlFromGemini = await generateWithGemini(
@@ -341,7 +360,7 @@ app.post("/api/generate", async (req, res) => {
       return res.json({ html: htmlFromGemini, prompt, provider: "gemini" });
     }
 
-    const htmlFromOpenAI = await generateWithOpenAI(
+    const htmlFromGroq = await generateWithGroq(
       prompt,
       selectedTheme,
       selectedSections,
@@ -349,8 +368,8 @@ app.post("/api/generate", async (req, res) => {
       selectedAudience,
       selectedCta
     );
-    if (htmlFromOpenAI) {
-      return res.json({ html: htmlFromOpenAI, prompt, provider: "openai" });
+    if (htmlFromGroq) {
+      return res.json({ html: htmlFromGroq, prompt, provider: "groq" });
     }
 
     const fallbackHtml = buildFallbackHtml(
@@ -361,13 +380,7 @@ app.post("/api/generate", async (req, res) => {
       selectedAudience,
       selectedCta
     );
-    const fallbackNote = openAiBillingUnavailable
-      ? "OpenAI credits are unavailable, so the local fallback generator is being used."
-      : geminiApiKeyInvalid
-        ? "Gemini API key is invalid. Replace GEMINI_API_KEY in .env; using the local fallback generator."
-        : hasFreeAiKey
-          ? "Gemini is unavailable, so the local fallback generator is being used."
-        : "No Gemini API key is configured; using the local fallback generator.";
+    const fallbackNote = getFallbackNote(hasConfiguredAiKey);
 
     return res.json({
       html: fallbackHtml,
@@ -389,13 +402,7 @@ app.post("/api/generate", async (req, res) => {
       html: fallbackHtml,
       prompt,
       provider: "fallback",
-      note: openAiBillingUnavailable
-        ? "OpenAI credits are unavailable, so the local fallback generator is being used."
-        : geminiApiKeyInvalid
-          ? "Gemini API key is invalid. Replace GEMINI_API_KEY in .env; using the local fallback generator."
-          : hasFreeAiKey
-            ? "Gemini is unavailable, so the local fallback generator is being used."
-            : "No Gemini API key is configured; using the local fallback generator.",
+      note: getFallbackNote(hasConfiguredAiKey),
     });
   }
 });
