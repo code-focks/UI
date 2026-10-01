@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node index.js",
-    "start": "node index.js"
+    "dev": "node api/index.js",
+    "start": "node api/index.js"
   },
   "engines": {
     "node": ">=20"
